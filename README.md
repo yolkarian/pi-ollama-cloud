@@ -15,6 +15,7 @@ Registers Ollama Cloud as a model provider with dynamically fetched models, and 
 - **`ollama_web_search` tool** - Search the web for real-time information using Ollama Cloud's `/api/web_search` endpoint. Returns titles, URLs, and content snippets.
 - **`ollama_web_fetch` tool** - Fetch and extract text content from a web page URL using Ollama Cloud's `/api/web_fetch` endpoint. Returns page title, content, and links.
 - **Zero cost tracking** - All models are registered with zero costs since Ollama Cloud uses a flat subscription model (Free, Pro, Max) rather than per-token billing. Per-request costs don't apply, so Pi's cost tracker always shows zero. See [ollama.com/pricing](https://ollama.com/pricing) for plan details.
+- **Cache hit metrics (automatic)** - Pi's OpenAI-completions adapter already reads `prompt_tokens_details.cached_tokens` from the response and surfaces cache-read tokens (`R` in the footer) plus cache-hit rate (`CH%`) and a `Cache Read` line in `/session` whenever the value is non-zero. Token counts come from the response and are independent of the (zero) cost config, so the metric shows for free under the subscription. Ollama Cloud does **not** return cache counts yet ([ollama/ollama#16714](https://github.com/ollama/ollama/issues/16714)); once it does — the pending [PR #16916](https://github.com/ollama/ollama/pull/16916) emits exactly this field for the OpenAI-compatible endpoint — the metrics appear automatically with no extension change. No `cache_control` markers or session-affinity headers are sent (Ollama uses implicit server-side KV cache only).
 
 ## Prerequisites
 
@@ -146,7 +147,7 @@ Model metadata is derived from the cached data:
 | `input` | `["text", "image"]` if `capabilities` includes `"vision"`, else `["text"]` |
 | `contextWindow` | `model_info.*.context_length` (falls back to 128000) |
 | `maxTokens` | Fixed at 32768 |
-| `cost` | All zeros (Ollama Cloud uses subscription plans, not per-token billing - see [pricing](https://ollama.com/pricing)) |
+| `cost` | All zeros (Ollama Cloud uses subscription plans, not per-token billing - see [pricing](https://ollama.com/pricing)). Cache-read/write token counts still flow through from the response when Ollama Cloud returns them (see Cache hit metrics above). |
 
 ### Thinking level mapping
 
