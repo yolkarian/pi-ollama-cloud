@@ -1,17 +1,38 @@
-import { AuthStorage } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { afterEach, describe, expect, it } from "vitest";
-import { getCloudApiKey } from "../web-tools.ts";
+import { getCloudApiKey, registerWebFetchTool, registerWebSearchTool } from "../web-tools.ts";
 
 /**
- * getCloudApiKey() resolves the API key for the ollama-cloud provider.
- *
- * Regressions covered:
- *   - The `?? process.env.OLLAMA_API_KEY` fallback was dead code because
- *     `authStorage.getApiKey()` is async and the original code did not
- *     await it (issue #24, fixed in PR #26).
+ * getCloudApiKey() resolves the API key for the ollama-cloud provider through
+ * pi's extension-facing model registry, with an environment fallback.
  */
 
 const ENV_KEY = "env-fallback-key";
+
+function createModelRegistry(apiKey: string | undefined) {
+  return {
+    async getApiKeyForProvider(provider: string): Promise<string | undefined> {
+      expect(provider).toBe("ollama-cloud");
+      return apiKey;
+    },
+  };
+}
+
+describe("web tool registration", () => {
+  it("registers both web tools", () => {
+    const registered: string[] = [];
+    const pi = {
+      registerTool(definition: { name: string }) {
+        registered.push(definition.name);
+      },
+    } as unknown as ExtensionAPI;
+
+    registerWebSearchTool(pi);
+    registerWebFetchTool(pi);
+
+    expect(registered).toEqual(["ollama_web_search", "ollama_web_fetch"]);
+  });
+});
 
 describe("getCloudApiKey", () => {
   const originalEnvKey = process.env.OLLAMA_API_KEY;
@@ -24,41 +45,35 @@ describe("getCloudApiKey", () => {
     }
   });
 
-  it("returns the auth.json api_key when configured", async () => {
-    const authStorage = AuthStorage.inMemory({
-      "ollama-cloud": { type: "api_key", key: "stored-key" },
-    });
+  it("returns the provider API key when configured", async () => {
+    const modelRegistry = createModelRegistry("stored-key");
     process.env.OLLAMA_API_KEY = ENV_KEY;
 
-    const key = await getCloudApiKey(authStorage);
+    const key = await getCloudApiKey(modelRegistry);
     expect(key).toBe("stored-key");
   });
 
-  it("falls back to OLLAMA_API_KEY env var when auth.json has no ollama-cloud entry", async () => {
-    // Regression test for issue #24: without `await`, the returned Promise
-    // is always truthy and the `??` fallback is never evaluated.
-    const authStorage = AuthStorage.inMemory({});
+  it("falls back to OLLAMA_API_KEY when the provider has no resolved key", async () => {
+    const modelRegistry = createModelRegistry(undefined);
     process.env.OLLAMA_API_KEY = ENV_KEY;
 
-    const key = await getCloudApiKey(authStorage);
+    const key = await getCloudApiKey(modelRegistry);
     expect(key).toBe(ENV_KEY);
   });
 
-  it("returns undefined when neither auth.json nor env var is set", async () => {
-    const authStorage = AuthStorage.inMemory({});
+  it("returns undefined when neither the provider nor environment has a key", async () => {
+    const modelRegistry = createModelRegistry(undefined);
     delete process.env.OLLAMA_API_KEY;
 
-    const key = await getCloudApiKey(authStorage);
+    const key = await getCloudApiKey(modelRegistry);
     expect(key).toBeUndefined();
   });
 
-  it("prefers auth.json api_key over the OLLAMA_API_KEY env var", async () => {
-    const authStorage = AuthStorage.inMemory({
-      "ollama-cloud": { type: "api_key", key: "stored-key" },
-    });
+  it("prefers the provider API key over OLLAMA_API_KEY", async () => {
+    const modelRegistry = createModelRegistry("stored-key");
     process.env.OLLAMA_API_KEY = ENV_KEY;
 
-    const key = await getCloudApiKey(authStorage);
+    const key = await getCloudApiKey(modelRegistry);
     expect(key).toBe("stored-key");
   });
 });

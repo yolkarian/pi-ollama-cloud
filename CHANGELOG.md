@@ -4,7 +4,7 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
-- Fix `ollama_web_search` and `ollama_web_fetch` always reporting "No Ollama Cloud API key configured" when the key was provided only via the `OLLAMA_API_KEY` environment variable. `getCloudApiKey()` returned the `Promise` from `authStorage.getApiKey()` directly, so the `?? process.env.OLLAMA_API_KEY` fallback was never evaluated. Awaiting the lookup restores the env-var fallback. Thanks @cawilliamson (#26).
+- Restore `ollama_web_search` and `ollama_web_fetch` compatibility with Pi 0.80.8+ after `AuthStorage` was removed from Pi's public API. Web tools now resolve credentials through the `ModelRegistry` provided to each tool context, while retaining the awaited `OLLAMA_API_KEY` fallback from #26. Also migrate tool schemas to Pi's current `typebox` package. Thanks @cawilliamson.
 - Refresh the generated model catalog from the live Ollama Cloud API. `deepseek-v4-pro` context window is now 524288 (was 1048576). Adds `glm-5.2` (1M context, text-only) and `kimi-k2.7-code` (262K context, text + image).
 - Refresh the generated model catalog from the live Ollama Cloud API. Removes `rnj-1:8b` (no longer listed as a tool-capable model). `glm-5.2` and the rest of the catalog are unchanged.
 - Add a `glm-5.2` thinking map exposing Pi `off`, `high`, and `xhigh` (`reasoning_effort: "none"`, `"high"`, and `"max"`).
