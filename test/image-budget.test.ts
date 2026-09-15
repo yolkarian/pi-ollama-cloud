@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   DEFAULT_MAX_REQUEST_BYTES,
   IMAGE_OMITTED_TEXT,
+  imageOmittedWithPath,
   OLLAMA_MAX_REQUEST_BYTES,
   trimImagesToBudget,
 } from "../image-budget.ts";
@@ -48,6 +49,59 @@ function hasPlaceholder(payload: { messages: Record<string, unknown>[] }, messag
   return content.some(
     (part) => typeof part === "object" && part !== null && (part as { text?: string }).text === IMAGE_OMITTED_TEXT,
   );
+}
+
+/** Text parts of one payload message, in order. */
+function messageTexts(payload: { messages: Record<string, unknown>[] }, messageIndex: number): string[] {
+  const content = payload.messages[messageIndex]?.content;
+  if (!Array.isArray(content)) return [];
+  return content
+    .filter((part) => typeof part === "object" && part !== null && (part as { type?: string }).type === "text")
+    .map((part) => (part as { text?: string }).text ?? "");
+}
+
+/** Assistant toolCall(s) -> tool result(s) -> the image user message pi builds. */
+function toolResultPayload(paths: string[]): { model: string; messages: Record<string, unknown>[] } {
+  return {
+    model: "gemma4:31b",
+    messages: [
+      { role: "system", content: "system prompt" },
+      {
+        role: "assistant",
+        content: null,
+        tool_calls: paths.map((path, index) => ({
+          id: `call_${index}`,
+          type: "function",
+          function: { name: "read", arguments: JSON.stringify({ path }) },
+        })),
+      },
+      ...paths.map((_path, index) => ({
+        role: "tool",
+        tool_call_id: `call_${index}`,
+        content: "(see attached image)",
+      })),
+      {
+        role: "user",
+        content: [{ type: "text", text: "Attached image(s) from tool result:" }, ...paths.map(() => imagePart(1024))],
+      },
+    ],
+  };
+}
+
+/** @file attachment: a text part with <file name> tags plus the inline image(s). */
+function fileAttachmentPayload(paths: string[]): { model: string; messages: Record<string, unknown>[] } {
+  return {
+    model: "gemma4:31b",
+    messages: [
+      {
+        role: "user",
+        content: [
+          { type: "text", text: `${paths.map((path) => `<file name="${path}"></file>`).join("\n")}\ndescribe` },
+          ...paths.map(() => imagePart(1024)),
+        ],
+      },
+    ],
+  };
 }
 
 // ============================================================================
@@ -147,5 +201,86 @@ describe("trimImagesToBudget", () => {
     expect(content[0].type).toBe("text");
     expect(content[1].text).toBe(IMAGE_OMITTED_TEXT);
     expect(content[2].text).toBe(IMAGE_OMITTED_TEXT);
+  });
+});
+
+// ============================================================================
+// Re-readable placeholders
+// ============================================================================
+
+describe("trimImagesToBudget path placeholders", () => {
+  it("uses the tool call's path so the model can re-read a dropped tool-result image", () => {
+    const payload = toolResultPayload(["/tmp/a.png"]);
+    const result = trimImagesToBudget(payload, 1);
+    const trimmed = result?.payload as { messages: Record<string, unknown>[] };
+
+    expect(result?.dropped).toBe(1);
+    expect(messageTexts(trimmed, 3)).toContain(imageOmittedWithPath("/tmp/a.png"));
+  });
+
+  it("pairs multiple tool results with their paths in order", () => {
+    const payload = toolResultPayload(["/tmp/a.png", "/tmp/b.png"]);
+    const result = trimImagesToBudget(payload, 1);
+    const trimmed = result?.payload as { messages: Record<string, unknown>[] };
+
+    expect(result?.dropped).toBe(2);
+    const texts = messageTexts(trimmed, 4);
+    expect(texts).toContain(imageOmittedWithPath("/tmp/a.png"));
+    expect(texts).toContain(imageOmittedWithPath("/tmp/b.png"));
+  });
+
+  it("keeps only the newest image when the budget allows one", () => {
+    const payload = toolResultPayload(["/tmp/a.png", "/tmp/b.png"]);
+    const partBytes = bytes(imagePart(1024));
+    const replacementBytes = bytes({ type: "text", text: imageOmittedWithPath("/tmp/a.png") });
+    const budget = bytes(payload) - partBytes + replacementBytes + 5;
+
+    const result = trimImagesToBudget(payload, budget);
+    const trimmed = result?.payload as { messages: Record<string, unknown>[] };
+
+    expect(result?.dropped).toBe(1);
+    expect(imageCount(trimmed)).toBe(1);
+    expect(messageTexts(trimmed, 4)).toContain(imageOmittedWithPath("/tmp/a.png"));
+  });
+
+  it("resolves paths across pi's synthetic assistant bridge between tool and image messages", () => {
+    const payload = toolResultPayload(["/tmp/a.png"]);
+    // requiresAssistantAfterToolResult providers insert this before the image message.
+    payload.messages.splice(3, 0, { role: "assistant", content: "I have processed the tool results." });
+
+    const result = trimImagesToBudget(payload, 1);
+    const trimmed = result?.payload as { messages: Record<string, unknown>[] };
+
+    expect(result?.dropped).toBe(1);
+    expect(messageTexts(trimmed, 4)).toContain(imageOmittedWithPath("/tmp/a.png"));
+  });
+
+  it("uses <file name> tags from @file attachments", () => {
+    const payload = fileAttachmentPayload(["/tmp/c.png"]);
+    const result = trimImagesToBudget(payload, 1);
+    const trimmed = result?.payload as { messages: Record<string, unknown>[] };
+
+    expect(result?.dropped).toBe(1);
+    expect(messageTexts(trimmed, 0)).toContain(imageOmittedWithPath("/tmp/c.png"));
+  });
+
+  it("maps multiple @file attachments to their tags by index", () => {
+    const payload = fileAttachmentPayload(["/tmp/c.png", "/tmp/d.png"]);
+    const result = trimImagesToBudget(payload, 1);
+    const trimmed = result?.payload as { messages: Record<string, unknown>[] };
+
+    expect(result?.dropped).toBe(2);
+    const texts = messageTexts(trimmed, 0);
+    expect(texts).toContain(imageOmittedWithPath("/tmp/c.png"));
+    expect(texts).toContain(imageOmittedWithPath("/tmp/d.png"));
+  });
+
+  it("falls back to the generic placeholder when no source path is recoverable", () => {
+    const payload = payloadWithImages([1024]);
+    const result = trimImagesToBudget(payload, 1);
+    const trimmed = result?.payload as { messages: Record<string, unknown>[] };
+
+    expect(result?.dropped).toBe(1);
+    expect(messageTexts(trimmed, 2)).toContain(IMAGE_OMITTED_TEXT);
   });
 });

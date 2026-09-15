@@ -4,7 +4,7 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
-- Fix vision sessions failing with `400 failed to read request body` once the conversation accumulates more than 16 MiB of inline images. Ollama Cloud rejects any request body above its 16 MiB cap before parsing, and pi re-sends every historical image on each turn, so past the cap every turn failed regardless of the prompt. A `before_provider_request` hook now replaces the oldest inline images with placeholder text (keeping the newest) until the serialized body fits the budget, configured with `"maxRequestBytes"` in `ollama-cloud.json` (default 14 MiB, clamped to Ollama's 16 MiB hard limit).
+- Fix vision sessions failing with `400 failed to read request body` once the conversation accumulates more than 16 MiB of inline images. Ollama Cloud rejects any request body above its 16 MiB cap before parsing, and pi re-sends every historical image on each turn, so past the cap every turn failed regardless of the prompt. A `before_provider_request` hook now replaces the oldest inline images with placeholder text (keeping the newest) until the serialized body fits the budget; when the image came from a file, the placeholder carries the source path (`[image omitted; re-read with read /path.png]`) so the model can re-read it on demand. Configure with `"maxRequestBytes"` in `ollama-cloud.json` (default 14 MiB, clamped to Ollama's 16 MiB hard limit).
 
 ## [0.12.1] - 2026-09-14
 

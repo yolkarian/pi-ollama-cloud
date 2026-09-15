@@ -11,7 +11,10 @@
  *
  * This module trims the oldest inline images out of the outgoing
  * OpenAI-completions payload (keeping the newest, which are the most relevant)
- * until the serialized body fits the budget.
+ * until the serialized body fits the budget. A trimmed image whose source file
+ * is recoverable (a `read` tool result or an `@file` attachment) is replaced
+ * with a path-bearing placeholder so the model can re-read it on demand instead
+ * of losing it for the rest of the session.
  */
 
 /**
@@ -23,8 +26,16 @@ export const OLLAMA_MAX_REQUEST_BYTES = 16 * 1024 * 1024;
 /** Default budget: 2 MiB below the cap, leaving room for headers and JSON escaping. */
 export const DEFAULT_MAX_REQUEST_BYTES = 14 * 1024 * 1024;
 
-/** Text substituted for an image dropped to satisfy the body budget. */
+/** Placeholder used when a trimmed image's source path is unknown. */
 export const IMAGE_OMITTED_TEXT = "[image omitted: Ollama Cloud request body limit]";
+
+/**
+ * Placeholder for a trimmed image whose file path is known: the model can
+ * recover the image with the `read` tool instead of losing it for the session.
+ */
+export function imageOmittedWithPath(path: string): string {
+  return `[image omitted; re-read with read ${path}]`;
+}
 
 export interface ImageTrimResult {
   /** The payload to send, with the oldest inline images replaced by placeholder text. */
@@ -45,6 +56,103 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function serializedBytes(value: unknown): number {
   return Buffer.byteLength(JSON.stringify(value) ?? "", "utf8");
+}
+
+/** Argument keys image-producing tools use for their source path, most specific first. */
+const PATH_ARGUMENT_KEYS = ["path", "file_path", "filePath", "file", "filename", "image"] as const;
+
+/** `<file name="/abs/path">` tags pi prepends to @file attachment text. */
+const FILE_TAG_PATTERN = /<file\s+name="([^"]+)"/g;
+
+function pathFromArguments(argumentsValue: unknown): string | undefined {
+  if (!isRecord(argumentsValue)) return undefined;
+  for (const key of PATH_ARGUMENT_KEYS) {
+    const value = argumentsValue[key];
+    if (typeof value === "string" && value.length > 0) return value;
+  }
+  return undefined;
+}
+
+/** Tool path from a serialized OpenAI tool call: `function.arguments` is a JSON string. */
+function pathFromToolCall(call: Record<string, unknown>): string | undefined {
+  const fn = call.function;
+  if (!isRecord(fn) || typeof fn.arguments !== "string") return undefined;
+  try {
+    return pathFromArguments(JSON.parse(fn.arguments));
+  } catch {
+    // Malformed arguments cannot name a file; fall back to the generic placeholder.
+    return undefined;
+  }
+}
+
+interface ImageRef {
+  /** Cloned `image_url` part to replace. */
+  part: Record<string, unknown>;
+  /** Replacement text, path-bearing when the source is known. */
+  text: string;
+}
+
+/**
+ * Associate every inline image with a source path when one is recoverable:
+ *
+ * - Tool-result images: the serialized OpenAI `assistant.tool_calls[].function.arguments`
+ *   (a JSON string), the `tool` result's `tool_call_id`, then the image-only
+ *   user message pi builds from consecutive tool results
+ *   ("Attached image(s) from tool result:").
+ * - `@file` attachments: the `<file name="...">` tags pi prepends to the text
+ *   part of the same user message.
+ *
+ * Images without a recoverable source fall back to the generic placeholder.
+ * Inputs are the already-cloned messages, so the returned parts are safe to mutate.
+ */
+function collectImageRefs(messages: unknown[]): ImageRef[] {
+  // tool call id -> source path
+  const toolPaths = new Map<string, string>();
+  const refs: ImageRef[] = [];
+  // Tool call paths for the tool results seen since the last assistant tool call,
+  // in order, waiting to be paired with the image message they produced.
+  let pendingToolPaths: (string | undefined)[] = [];
+
+  for (const message of messages) {
+    if (!isRecord(message)) continue;
+
+    if (message.role === "assistant") {
+      const toolCalls = Array.isArray(message.tool_calls) ? message.tool_calls : [];
+      for (const call of toolCalls) {
+        if (!isRecord(call) || typeof call.id !== "string") continue;
+        const path = pathFromToolCall(call);
+        if (path) toolPaths.set(call.id, path);
+      }
+      // A synthetic "I have processed the tool results." bridge has no
+      // tool_calls and must not reset the pairing.
+      if (toolCalls.length > 0) pendingToolPaths = [];
+      continue;
+    }
+
+    if (message.role === "tool") {
+      const id = message.tool_call_id;
+      pendingToolPaths.push(typeof id === "string" ? toolPaths.get(id) : undefined);
+      continue;
+    }
+    if (message.role !== "user" || !Array.isArray(message.content)) continue;
+
+    const images = message.content.filter((p): p is Record<string, unknown> => isRecord(p) && p.type === "image_url");
+    if (images.length === 0) continue;
+
+    const filePaths: string[] = [];
+    for (const part of message.content) {
+      if (!isRecord(part) || part.type !== "text" || typeof part.text !== "string") continue;
+      for (const match of part.text.matchAll(FILE_TAG_PATTERN)) filePaths.push(match[1]);
+    }
+
+    images.forEach((part, index) => {
+      const path = filePaths[index] ?? pendingToolPaths[index];
+      refs.push({ part, text: path ? imageOmittedWithPath(path) : IMAGE_OMITTED_TEXT });
+    });
+    pendingToolPaths = [];
+  }
+
+  return refs;
 }
 
 /**
@@ -76,31 +184,25 @@ export function trimImagesToBudget(
     };
   });
 
-  const imageParts: Record<string, unknown>[] = [];
-  for (const message of messages) {
-    if (!isRecord(message) || !Array.isArray(message.content)) continue;
-    for (const part of message.content) {
-      if (isRecord(part) && part.type === "image_url") imageParts.push(part);
-    }
-  }
-  if (imageParts.length === 0) return undefined;
+  const refs = collectImageRefs(messages);
+  if (refs.length === 0) return undefined;
 
   const next: Record<string, unknown> = { ...payload, messages };
-  const replacementBytes = serializedBytes({ type: "text", text: IMAGE_OMITTED_TEXT });
   let afterBytes = beforeBytes;
   let dropped = 0;
 
   // Oldest first. Swapping one part for another leaves the surrounding JSON
   // (commas, brackets) unchanged, so the byte delta is exact.
-  for (const part of imageParts) {
+  for (const ref of refs) {
     if (afterBytes <= budgetBytes) break;
-    afterBytes -= serializedBytes(part) - replacementBytes;
-    delete part.image_url;
-    part.type = "text";
-    part.text = IMAGE_OMITTED_TEXT;
+    const replacementBytes = serializedBytes({ type: "text", text: ref.text });
+    afterBytes -= serializedBytes(ref.part) - replacementBytes;
+    delete ref.part.image_url;
+    ref.part.type = "text";
+    ref.part.text = ref.text;
     dropped += 1;
   }
   if (dropped === 0) return undefined;
 
-  return { payload: next, beforeBytes, afterBytes, imageCount: imageParts.length, dropped };
+  return { payload: next, beforeBytes, afterBytes, imageCount: refs.length, dropped };
 }
