@@ -11,7 +11,8 @@
  * Example ollama-cloud.json:
  * ```json
  * {
- *   "webTools": false
+ *   "webTools": false,
+ *   "maxRequestBytes": 14680064
  * }
  * ```
  */
@@ -19,6 +20,7 @@
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
+import { DEFAULT_MAX_REQUEST_BYTES, OLLAMA_MAX_REQUEST_BYTES } from "./image-budget.ts";
 
 // --- Types ---
 
@@ -27,6 +29,13 @@ export interface OllamaCloudConfig {
   webTools?: boolean;
   /** When true, the footer usage status bar is shown. Default: false (opt-in; enable with /ollama-usage-status). */
   usageStatus?: boolean;
+  /**
+   * Outgoing request-body budget in bytes. When the serialized body exceeds it,
+   * the oldest inline images are replaced with placeholder text until it fits.
+   * Default: 14 MiB. Values above Ollama's 16 MiB hard limit are clamped, since
+   * bodies over the limit are rejected before the model sees them.
+   */
+  maxRequestBytes?: number;
 }
 
 // --- Defaults ---
@@ -34,14 +43,16 @@ export interface OllamaCloudConfig {
 const DEFAULT_CONFIG: OllamaCloudConfig = {
   webTools: true,
   usageStatus: false,
+  maxRequestBytes: DEFAULT_MAX_REQUEST_BYTES,
 };
 
 // --- Validation ---
 
 /** Allowed config keys and their expected types for runtime validation. */
-const CONFIG_SCHEMA: Record<keyof OllamaCloudConfig, "boolean"> = {
+const CONFIG_SCHEMA: Record<keyof OllamaCloudConfig, "boolean" | "number"> = {
   webTools: "boolean",
   usageStatus: "boolean",
+  maxRequestBytes: "number",
 };
 
 /**
@@ -52,6 +63,14 @@ function sanitizeConfig(raw: Record<string, unknown>): OllamaCloudConfig {
   const out: OllamaCloudConfig = {};
   for (const [key, expectedType] of Object.entries(CONFIG_SCHEMA)) {
     const value = raw[key];
+    if (expectedType === "number") {
+      // Only positive integers are meaningful; clamp to Ollama's hard cap since
+      // a larger budget cannot prevent the 400 it is meant to avoid.
+      if (typeof value === "number" && Number.isInteger(value) && value > 0) {
+        (out as Record<string, unknown>)[key] = Math.min(value, OLLAMA_MAX_REQUEST_BYTES);
+      }
+      continue;
+    }
     if (typeof value === expectedType) {
       (out as Record<string, unknown>)[key] = value;
     }

@@ -22,10 +22,15 @@
  *     through pi's own FileModelsStore. Refresh is automatic.
  *
  * Only models with "tools" capability are registered.
+ *
+ * Ollama Cloud caps request bodies at 16 MiB; the extension drops the oldest
+ * inline images from a payload that exceeds the configured budget so long
+ * vision sessions keep working (see image-budget.ts).
  */
 
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { loadConfig, resolveWebToolsEnv } from "./config.ts";
+import { DEFAULT_MAX_REQUEST_BYTES, trimImagesToBudget } from "./image-budget.ts";
 import { GENERATED_MODELS } from "./models.generated.ts";
 import { OLLAMA_BASE, refreshOllamaCatalog } from "./models.ts";
 import { fetchUsage, formatUsage, formatUsageStatusColored } from "./usage.ts";
@@ -57,6 +62,26 @@ export default async function (pi: ExtensionAPI) {
     api: "openai-completions",
     models: GENERATED_MODELS,
     refreshModels: refreshOllamaCatalog,
+  });
+
+  // --- Request Body Budget ---
+
+  // Ollama Cloud rejects request bodies over 16 MiB with `400 failed to read
+  // request body`. Pi re-sends every historical image on each turn, so a vision
+  // session crosses the cap after a few screenshots and then fails on every
+  // subsequent turn. Drop the oldest inline images until the body fits the
+  // budget. See image-budget.ts; the budget comes from `maxRequestBytes` in
+  // ollama-cloud.json, read on the first session_start below.
+  let requestBodyBudgetBytes = DEFAULT_MAX_REQUEST_BYTES;
+  pi.on("before_provider_request", (event, ctx) => {
+    if (!isOllamaCloud(ctx)) return;
+    const result = trimImagesToBudget(event.payload, requestBodyBudgetBytes);
+    if (!result) return;
+    console.debug(
+      `[pi-ollama-cloud] Dropped ${result.dropped}/${result.imageCount} image(s) from the request body ` +
+        `(${result.beforeBytes} -> ${result.afterBytes} bytes, budget ${requestBodyBudgetBytes}).`,
+    );
+    return result.payload;
   });
 
   // --- Web Tools Management ---
@@ -118,6 +143,7 @@ export default async function (pi: ExtensionAPI) {
       }
       // The status bar is opt-in: enabled only when the config explicitly sets it true.
       usageStatusEnabled = config.usageStatus === true;
+      requestBodyBudgetBytes = config.maxRequestBytes ?? DEFAULT_MAX_REQUEST_BYTES;
     }
     // On every session start (including resume/fork/new), re-apply the
     // runtime state. Tools may have been unregistered during teardown.

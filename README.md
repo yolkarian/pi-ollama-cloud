@@ -98,13 +98,15 @@ Extension settings can be set via JSON config files. Project-local settings over
 |---|---|---|---|
 | `webTools` | boolean | `true` | Set to `false` to prevent `ollama_web_search` and `ollama_web_fetch` from being registered |
 | `usageStatus` | boolean | `false` | Set to `true` to show the footer usage status bar (opt-in; enable at runtime with `/ollama-usage-status`) |
+| `maxRequestBytes` | number | `14680064` (14 MiB) | Request-body budget in bytes. When a request body exceeds it, the oldest inline images are replaced with placeholder text until it fits. Values above Ollama's 16 MiB hard limit are clamped. |
 
 Example `ollama-cloud.json`:
 
 ```json
 {
   "webTools": false,
-  "usageStatus": true
+  "usageStatus": true,
+  "maxRequestBytes": 12582912
 }
 ```
 
@@ -143,6 +145,12 @@ The per-model max output token table (`limits.generated.ts`) is probed against t
 The API itself returns no cost data: completion responses report only token counts (`prompt_tokens`/`completion_tokens`/`total_tokens`, including the final usage chunk when streaming), and `/api/show` exposes no pricing fields. The prices above come from the static `/pricing` page table and are only as fresh as the last regeneration.
 
 Cache pricing is informational only: the `/pricing` page lists a "Cached input" column, but the completion API does not report cache token usage (there is no `prompt_tokens_details.cached_tokens` or equivalent in any response, verified against the live API in September 2026), so pi never sees cache hits and `/cost` estimates do not reflect them. `cacheWrite` is always zero because the pricing table has no cache-write column.
+
+### Request-body size limit
+
+Ollama Cloud rejects any request body larger than 16 MiB before parsing it, returning `400 failed to read request body`. Pi re-sends the whole conversation on every turn, including every inline image, and only bounds a single image (2000x2000, 4.5 MB base64), never the total. A vision session therefore crosses the cap after enough screenshots and then fails on every subsequent turn, even for prompts that add no new image.
+
+To keep those sessions working, the extension runs a `before_provider_request` hook that measures the serialized body and, when it exceeds `maxRequestBytes`, replaces the oldest inline images with `[image omitted: Ollama Cloud request body limit]`. The newest images are kept, since a vision turn usually refers to the most recent screenshot. The default budget is 14 MiB, leaving room for headers and JSON escaping below the 16 MiB cap; raise or lower it with `maxRequestBytes` in `ollama-cloud.json`. The session itself is not modified, so the images remain in history and in pi's `/context` accounting - only the outgoing request is trimmed.
 
 ### Thinking level mapping
 
