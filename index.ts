@@ -23,9 +23,10 @@
  *
  * Only models with "tools" capability are registered.
  *
- * Ollama Cloud caps request bodies at 16 MiB; the extension drops the oldest
- * inline images from a payload that exceeds the configured budget so long
- * vision sessions keep working (see image-budget.ts).
+ * Ollama Cloud caps request bodies at 16 MiB; the extension de-duplicates
+ * repeated inline images and drops the oldest remaining ones from a payload
+ * that exceeds the configured budget so long vision sessions keep working (see
+ * image-budget.ts).
  */
 
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -69,8 +70,9 @@ export default async function (pi: ExtensionAPI) {
   // Ollama Cloud rejects request bodies over 16 MiB with `400 failed to read
   // request body`. Pi re-sends every historical image on each turn, so a vision
   // session crosses the cap after a few screenshots and then fails on every
-  // subsequent turn. Drop the oldest inline images until the body fits the
-  // budget. See image-budget.ts; the budget comes from `maxRequestBytes` in
+  // subsequent turn. Repeated images are de-duplicated first, then the oldest
+  // remaining images are dropped until the body fits the budget. See
+  // image-budget.ts; the budget comes from `maxRequestBytes` in
   // ollama-cloud.json, read on the first session_start below.
   let requestBodyBudgetBytes = DEFAULT_MAX_REQUEST_BYTES;
   pi.on("before_provider_request", (event, ctx) => {
@@ -78,8 +80,9 @@ export default async function (pi: ExtensionAPI) {
     const result = trimImagesToBudget(event.payload, requestBodyBudgetBytes);
     if (!result) return;
     console.debug(
-      `[pi-ollama-cloud] Dropped ${result.dropped}/${result.imageCount} image(s) from the request body ` +
-        `(${result.beforeBytes} -> ${result.afterBytes} bytes, budget ${requestBodyBudgetBytes}).`,
+      `[pi-ollama-cloud] Request body over the ${requestBodyBudgetBytes}-byte budget ` +
+        `(${result.beforeBytes} -> ${result.afterBytes}): dropped ${result.dropped}/${result.imageCount} image(s), ` +
+        `de-duplicated ${result.deduplicated}.`,
     );
     return result.payload;
   });

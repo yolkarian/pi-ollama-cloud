@@ -9,12 +9,18 @@
  * 4.5 MB base64) - never the total. A vision session therefore crosses the cap
  * after a handful of screenshots and then fails on every subsequent turn.
  *
- * This module trims the oldest inline images out of the outgoing
- * OpenAI-completions payload (keeping the newest, which are the most relevant)
- * until the serialized body fits the budget. A trimmed image whose source file
- * is recoverable (a `read` tool result or an `@file` attachment) is replaced
- * with a path-bearing placeholder so the model can re-read it on demand instead
- * of losing it for the rest of the session.
+ * When the serialized body exceeds the budget, this module:
+ *
+ * 1. De-duplicates repeated images, keeping the newest copy of each identical
+ *    payload (re-reading the same screenshot across turns is common) and
+ *    replacing older copies with placeholder text.
+ * 2. If the body is still over budget, replaces the oldest remaining images
+ *    with placeholder text, keeping the newest (a vision turn usually refers to
+ *    the most recent screenshot).
+ *
+ * A replaced image whose source file is recoverable (a `read` tool result or an
+ * `@file` attachment) gets a path-bearing placeholder so the model can re-read
+ * it on demand instead of losing it for the rest of the session.
  */
 
 /**
@@ -26,27 +32,40 @@ export const OLLAMA_MAX_REQUEST_BYTES = 16 * 1024 * 1024;
 /** Default budget: 2 MiB below the cap, leaving room for headers and JSON escaping. */
 export const DEFAULT_MAX_REQUEST_BYTES = 14 * 1024 * 1024;
 
-/** Placeholder used when a trimmed image's source path is unknown. */
+/** Placeholder used when a dropped image's source path is unknown. */
 export const IMAGE_OMITTED_TEXT = "[image omitted: Ollama Cloud request body limit]";
 
 /**
- * Placeholder for a trimmed image whose file path is known: the model can
+ * Placeholder for a dropped image whose file path is known: the model can
  * recover the image with the `read` tool instead of losing it for the session.
  */
 export function imageOmittedWithPath(path: string): string {
   return `[image omitted; re-read with read ${path}]`;
 }
 
+/** Placeholder for an older copy of an image that also appears later in the request. */
+export const DUPLICATE_IMAGE_TEXT = "[duplicate image omitted: identical to a newer copy in this request]";
+
+/**
+ * Duplicate placeholder for an image whose file path is known. The path hint
+ * still matters because budget trimming may later remove the newer copy.
+ */
+export function duplicateImageWithPath(path: string): string {
+  return `[duplicate image omitted: identical to a newer copy in this request; re-read with read ${path}]`;
+}
+
 export interface ImageTrimResult {
-  /** The payload to send, with the oldest inline images replaced by placeholder text. */
+  /** The payload to send, with repeated or over-budget images replaced by placeholder text. */
   payload: unknown;
   /** Serialized size of the original payload, in bytes. */
   beforeBytes: number;
   /** Serialized size of the returned payload, in bytes. */
   afterBytes: number;
-  /** Number of inline images found in the original payload. */
+  /** Number of distinct inline images found in the original payload. */
   imageCount: number;
-  /** Number of inline images replaced by placeholder text. */
+  /** Older copies of an image that appears later in the payload. */
+  deduplicated: number;
+  /** Images replaced by the omission placeholder to fit the budget. */
   dropped: number;
 }
 
@@ -56,6 +75,12 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function serializedBytes(value: unknown): number {
   return Buffer.byteLength(JSON.stringify(value) ?? "", "utf8");
+}
+
+function imageUrl(part: Record<string, unknown>): string | undefined {
+  const imageUrlField = part.image_url;
+  if (!isRecord(imageUrlField)) return undefined;
+  return typeof imageUrlField.url === "string" ? imageUrlField.url : undefined;
 }
 
 /** Argument keys image-producing tools use for their source path, most specific first. */
@@ -88,8 +113,8 @@ function pathFromToolCall(call: Record<string, unknown>): string | undefined {
 interface ImageRef {
   /** Cloned `image_url` part to replace. */
   part: Record<string, unknown>;
-  /** Replacement text, path-bearing when the source is known. */
-  text: string;
+  /** Source file path, when recoverable. */
+  path?: string;
 }
 
 /**
@@ -146,8 +171,7 @@ function collectImageRefs(messages: unknown[]): ImageRef[] {
     }
 
     images.forEach((part, index) => {
-      const path = filePaths[index] ?? pendingToolPaths[index];
-      refs.push({ part, text: path ? imageOmittedWithPath(path) : IMAGE_OMITTED_TEXT });
+      refs.push({ part, path: filePaths[index] ?? pendingToolPaths[index] });
     });
     pendingToolPaths = [];
   }
@@ -155,15 +179,26 @@ function collectImageRefs(messages: unknown[]): ImageRef[] {
   return refs;
 }
 
+/** Replace an image part with text in place, returning the resulting byte delta. */
+function replaceImageWithText(ref: ImageRef, text: string): number {
+  const delta = serializedBytes(ref.part) - serializedBytes({ type: "text", text });
+  delete ref.part.image_url;
+  ref.part.type = "text";
+  ref.part.text = text;
+  return delta;
+}
+
 /**
- * Drop the oldest inline images from an OpenAI-completions payload until its
- * serialized size fits `budgetBytes`. The newest images are kept, since a
- * vision turn usually refers to the most recent screenshot. The input payload
- * is never mutated: pi reuses the payload object across retries.
+ * Trim an OpenAI-completions payload until its serialized size fits
+ * `budgetBytes`. Repeated images are de-duplicated first (newest copy kept); if
+ * the body is still over budget, the oldest remaining images are dropped, newest
+ * kept. The input payload is never mutated: pi reuses the payload object across
+ * retries.
  *
- * Returns undefined when there is nothing to trim (no messages, no images, or
- * already within budget). When even dropping every image leaves the body over
- * budget (oversized text), the trimmed payload is still returned.
+ * Returns undefined when there is nothing to change (no messages, no images, or
+ * already within budget). When even de-duplicating and dropping every image
+ * leaves the body over budget (oversized text), the reduced payload is still
+ * returned.
  */
 export function trimImagesToBudget(
   payload: unknown,
@@ -189,20 +224,34 @@ export function trimImagesToBudget(
 
   const next: Record<string, unknown> = { ...payload, messages };
   let afterBytes = beforeBytes;
-  let dropped = 0;
 
-  // Oldest first. Swapping one part for another leaves the surrounding JSON
-  // (commas, brackets) unchanged, so the byte delta is exact.
+  // 1. De-duplicate: keep the newest copy of each identical image payload and
+  // replace every earlier copy. Swapping one part for another leaves the
+  // surrounding JSON (commas, brackets) unchanged, so the byte delta is exact.
+  const newestIndexByUrl = new Map<string, number>();
+  refs.forEach((ref, index) => {
+    const url = imageUrl(ref.part);
+    if (url) newestIndexByUrl.set(url, index);
+  });
+  let deduplicated = 0;
+  refs.forEach((ref, index) => {
+    const url = imageUrl(ref.part);
+    if (!url || newestIndexByUrl.get(url) === index) return;
+    const text = ref.path ? duplicateImageWithPath(ref.path) : DUPLICATE_IMAGE_TEXT;
+    afterBytes -= replaceImageWithText(ref, text);
+    deduplicated += 1;
+  });
+
+  // 2. Drop the oldest remaining images until the body fits.
+  let dropped = 0;
   for (const ref of refs) {
     if (afterBytes <= budgetBytes) break;
-    const replacementBytes = serializedBytes({ type: "text", text: ref.text });
-    afterBytes -= serializedBytes(ref.part) - replacementBytes;
-    delete ref.part.image_url;
-    ref.part.type = "text";
-    ref.part.text = ref.text;
+    if (ref.part.type !== "image_url") continue; // already replaced as a duplicate
+    const text = ref.path ? imageOmittedWithPath(ref.path) : IMAGE_OMITTED_TEXT;
+    afterBytes -= replaceImageWithText(ref, text);
     dropped += 1;
   }
-  if (dropped === 0) return undefined;
 
-  return { payload: next, beforeBytes, afterBytes, imageCount: refs.length, dropped };
+  if (deduplicated === 0 && dropped === 0) return undefined;
+  return { payload: next, beforeBytes, afterBytes, imageCount: refs.length, deduplicated, dropped };
 }

@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
 import {
   DEFAULT_MAX_REQUEST_BYTES,
+  DUPLICATE_IMAGE_TEXT,
+  duplicateImageWithPath,
   IMAGE_OMITTED_TEXT,
   imageOmittedWithPath,
   OLLAMA_MAX_REQUEST_BYTES,
@@ -9,8 +11,8 @@ import {
 
 // --- Helpers ---
 
-function imagePart(payloadBytes: number): { type: "image_url"; image_url: { url: string } } {
-  return { type: "image_url", image_url: { url: `data:image/png;base64,${"A".repeat(payloadBytes)}` } };
+function imagePart(payloadBytes: number, salt = ""): { type: "image_url"; image_url: { url: string } } {
+  return { type: "image_url", image_url: { url: `data:image/png;base64,${salt}${"A".repeat(payloadBytes)}` } };
 }
 
 /** Payload with one user message per image, each carrying a text part too. */
@@ -22,7 +24,7 @@ function payloadWithImages(imageBytes: number[]): { model: string; messages: Rec
       { role: "user", content: [{ type: "text", text: "describe the images" }] },
       ...imageBytes.map((bytes, index) => ({
         role: "user",
-        content: [{ type: "text", text: `image ${index}` }, imagePart(bytes)],
+        content: [{ type: "text", text: `image ${index}` }, imagePart(bytes, `s${index}`)],
       })),
     ],
   };
@@ -61,7 +63,10 @@ function messageTexts(payload: { messages: Record<string, unknown>[] }, messageI
 }
 
 /** Assistant toolCall(s) -> tool result(s) -> the image user message pi builds. */
-function toolResultPayload(paths: string[]): { model: string; messages: Record<string, unknown>[] } {
+function toolResultPayload(
+  paths: string[],
+  salts: string[] = paths.map((_path, index) => `s${index}`),
+): { model: string; messages: Record<string, unknown>[] } {
   return {
     model: "gemma4:31b",
     messages: [
@@ -82,7 +87,10 @@ function toolResultPayload(paths: string[]): { model: string; messages: Record<s
       })),
       {
         role: "user",
-        content: [{ type: "text", text: "Attached image(s) from tool result:" }, ...paths.map(() => imagePart(1024))],
+        content: [
+          { type: "text", text: "Attached image(s) from tool result:" },
+          ...paths.map((_path, index) => imagePart(1024, salts[index])),
+        ],
       },
     ],
   };
@@ -97,7 +105,7 @@ function fileAttachmentPayload(paths: string[]): { model: string; messages: Reco
         role: "user",
         content: [
           { type: "text", text: `${paths.map((path) => `<file name="${path}"></file>`).join("\n")}\ndescribe` },
-          ...paths.map(() => imagePart(1024)),
+          ...paths.map((_path, index) => imagePart(1024, `s${index}`)),
         ],
       },
     ],
@@ -134,7 +142,7 @@ describe("trimImagesToBudget", () => {
 
   it("drops the oldest image first and keeps the newest", () => {
     const payload = payloadWithImages([IMAGE_BYTES, IMAGE_BYTES]);
-    const partBytes = bytes(imagePart(IMAGE_BYTES));
+    const partBytes = bytes(imagePart(IMAGE_BYTES, "s0"));
     const replacementBytes = bytes({ type: "text", text: IMAGE_OMITTED_TEXT });
     // Room for exactly one of the two images.
     const budget = bytes(payload) - partBytes + replacementBytes + 5;
@@ -143,6 +151,7 @@ describe("trimImagesToBudget", () => {
     const trimmed = result?.payload as { messages: Record<string, unknown>[] };
 
     expect(result).toBeDefined();
+    expect(result?.deduplicated).toBe(0);
     expect(result?.dropped).toBe(1);
     expect(result?.imageCount).toBe(2);
     expect(result?.afterBytes).toBeLessThanOrEqual(budget);
@@ -156,6 +165,7 @@ describe("trimImagesToBudget", () => {
     const result = trimImagesToBudget(payload, 1);
     const trimmed = result?.payload as { messages: Record<string, unknown>[] };
 
+    expect(result?.deduplicated).toBe(0);
     expect(result?.dropped).toBe(3);
     expect(result?.imageCount).toBe(3);
     expect(imageCount(trimmed)).toBe(0);
@@ -188,13 +198,14 @@ describe("trimImagesToBudget", () => {
       messages: [
         {
           role: "user",
-          content: [{ type: "text", text: "two images" }, imagePart(IMAGE_BYTES), imagePart(IMAGE_BYTES)],
+          content: [{ type: "text", text: "two images" }, imagePart(IMAGE_BYTES, "a"), imagePart(IMAGE_BYTES, "b")],
         },
       ],
     };
     const result = trimImagesToBudget(payload, 1);
     const trimmed = result?.payload as { messages: Record<string, unknown>[] };
 
+    expect(result?.deduplicated).toBe(0);
     expect(result?.dropped).toBe(2);
     expect(imageCount(trimmed)).toBe(0);
     const content = trimmed.messages[0].content as { type: string; text?: string }[];
@@ -231,7 +242,7 @@ describe("trimImagesToBudget path placeholders", () => {
 
   it("keeps only the newest image when the budget allows one", () => {
     const payload = toolResultPayload(["/tmp/a.png", "/tmp/b.png"]);
-    const partBytes = bytes(imagePart(1024));
+    const partBytes = bytes(imagePart(1024, "s0"));
     const replacementBytes = bytes({ type: "text", text: imageOmittedWithPath("/tmp/a.png") });
     const budget = bytes(payload) - partBytes + replacementBytes + 5;
 
@@ -282,5 +293,78 @@ describe("trimImagesToBudget path placeholders", () => {
 
     expect(result?.dropped).toBe(1);
     expect(messageTexts(trimmed, 2)).toContain(IMAGE_OMITTED_TEXT);
+  });
+});
+
+// ============================================================================
+// Image de-duplication
+// ============================================================================
+
+describe("trimImagesToBudget de-duplication", () => {
+  /** Three user-image messages: the first and last carry identical bytes. */
+  function duplicatedPayload() {
+    return {
+      model: "gemma4:31b",
+      messages: [
+        { role: "user", content: [{ type: "text", text: "a" }, imagePart(1024, "dup")] },
+        { role: "user", content: [{ type: "text", text: "b" }, imagePart(1024, "unique")] },
+        { role: "user", content: [{ type: "text", text: "c" }, imagePart(1024, "dup")] },
+      ],
+    };
+  }
+
+  it("replaces the older copy and keeps the newest", () => {
+    const payload = duplicatedPayload();
+    // De-duplication alone is enough to get under budget.
+    const budget = bytes(payload) - 1;
+
+    const result = trimImagesToBudget(payload, budget);
+    const trimmed = result?.payload as { messages: Record<string, unknown>[] };
+
+    expect(result?.deduplicated).toBe(1);
+    expect(result?.dropped).toBe(0);
+    expect(result?.imageCount).toBe(3);
+    expect(result?.afterBytes).toBeLessThanOrEqual(budget);
+    expect(messageTexts(trimmed, 0)).toContain(DUPLICATE_IMAGE_TEXT);
+    expect(imageCount(trimmed)).toBe(2);
+    // The newest copy of the duplicated image is still inline.
+    const newest = trimmed.messages[2].content as { type?: string }[];
+    expect(newest.some((part) => part.type === "image_url")).toBe(true);
+  });
+
+  it("uses a path-bearing duplicate placeholder when the source is known", () => {
+    const payload = toolResultPayload(["/tmp/a.png", "/tmp/b.png"], ["dup", "dup"]);
+    const result = trimImagesToBudget(payload, bytes(payload) - 1);
+    const trimmed = result?.payload as { messages: Record<string, unknown>[] };
+
+    expect(result?.deduplicated).toBe(1);
+    expect(result?.dropped).toBe(0);
+    expect(messageTexts(trimmed, 4)).toContain(duplicateImageWithPath("/tmp/a.png"));
+  });
+
+  it("de-duplicates first, then drops the oldest remaining images", () => {
+    const payload = duplicatedPayload();
+    const result = trimImagesToBudget(payload, 1);
+    const trimmed = result?.payload as { messages: Record<string, unknown>[] };
+
+    expect(result?.deduplicated).toBe(1);
+    expect(result?.dropped).toBe(2);
+    expect(imageCount(trimmed)).toBe(0);
+    expect(messageTexts(trimmed, 0)).toContain(DUPLICATE_IMAGE_TEXT);
+  });
+
+  it("does not de-duplicate when the body is already within budget", () => {
+    const payload = duplicatedPayload();
+    expect(trimImagesToBudget(payload, bytes(payload) + 1)).toBeUndefined();
+    expect(imageCount(payload)).toBe(3);
+  });
+
+  it("does not mutate the input payload", () => {
+    const payload = duplicatedPayload();
+    const snapshot = JSON.stringify(payload);
+    trimImagesToBudget(payload, 1);
+
+    expect(JSON.stringify(payload)).toBe(snapshot);
+    expect(imageCount(payload)).toBe(3);
   });
 });
